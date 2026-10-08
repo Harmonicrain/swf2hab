@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swf2hab"
+version = "0.1.0"
+description = "Convert Habbo Flash asset libraries (.swf) into Habbo HTML5 .hab bundles"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+fast = ["numpy", "Pillow"]
+
+[project.scripts]
+swf2hab = "swf2hab.cli:main"
+
+[tool.setuptools]
+packages = ["swf2hab"]

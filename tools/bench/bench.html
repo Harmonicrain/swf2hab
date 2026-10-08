@@ -1,0 +1,207 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>SWF vs HAB decode</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;padding:12px}pre{white-space:pre-wrap}</style></head>
+<body>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+<script src="skyinflate.js"></script>
+<h3>SWF vs HAB decode benchmark</h3><pre id="out">loading…</pre>
+<script>
+const out = document.getElementById('out');
+const log = s => { out.textContent += '\n' + s; };
+const u16 = (b, o) => b[o] | (b[o + 1] << 8);
+const u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
+const be32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+const td = new TextDecoder();
+const parser = new DOMParser();
+
+// ---------------------------------------------------------------- inflaters
+async function streamInflate(u8) {
+  const s = new Blob([u8]).stream().pipeThrough(new DecompressionStream('deflate'));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+const INFLATERS = { sky: u8 => SkyInflate.inflate(u8), pako: u8 => pako.inflate(u8), stream: streamInflate };
+let inflate = INFLATERS.sky;
+let offThread = 0;   // ms spent awaiting work the browser does off the main thread
+
+// ---------------------------------------------------------------- SWF path (SkyHaxe SwfFile + SwfBitmap.decode)
+async function parseSwf(bytes) {
+  let raw = bytes;
+  if (bytes[0] === 0x43) { const body = await inflate(bytes.subarray(8)); raw = new Uint8Array(8 + body.length); raw.set(bytes.subarray(0, 8)); raw.set(body, 8); }
+  const nbits = raw[8] >> 3; let pos = 8 + ((5 + nbits * 4 + 7) >> 3) + 4;
+  const symbols = [], bitmaps = new Map(), binaries = new Map();
+  while (pos + 2 <= raw.length) {
+    const cl = u16(raw, pos); pos += 2; const code = cl >> 6; let len = cl & 63;
+    if (len === 63) { len = u32(raw, pos); pos += 4; }
+    const body = raw.subarray(pos, pos + len); pos += len;
+    if (code === 76) { let p = 2; const n = u16(body, 0); for (let i = 0; i < n; i++) { const id = u16(body, p); p += 2; let e = p; while (body[e]) e++; symbols.push([id, td.decode(body.subarray(p, e))]); p = e + 1; } }
+    else if (code === 20 || code === 36) bitmaps.set(u16(body, 0), { tag: code, payload: body });
+    else if (code === 87) binaries.set(u16(body, 0), body.subarray(6));
+    if (code === 0) break;
+  }
+  const doc = (symbols.find(s => s[0] === 0) || [0, ''])[1];
+  const man = symbols.find(s => s[1] === doc + '_manifest');
+  if (man && binaries.has(man[0])) parser.parseFromString(td.decode(binaries.get(man[0])), 'text/xml');
+  return { doc, symbols, bitmaps };
+}
+function unpremultiply(c, a) { return a === 0 ? 0 : Math.min(255, Math.floor((c * 255 + (a >> 1)) / a)); }
+async function decodeLossless(bm) {
+  const p = bm.payload, format = p[2], w = u16(p, 3), h = u16(p, 5), alpha = bm.tag === 36;
+  let cursor = 7, table = 0; if (format === 3) table = p[cursor++] + 1;
+  const data = await inflate(p.subarray(cursor));
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  if (format === 5) {
+    for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+      const a = alpha ? data[j] : 255;
+      rgba[j] = alpha ? unpremultiply(data[j + 1], a) : data[j + 1];
+      rgba[j + 1] = alpha ? unpremultiply(data[j + 2], a) : data[j + 2];
+      rgba[j + 2] = alpha ? unpremultiply(data[j + 3], a) : data[j + 3];
+      rgba[j + 3] = a;
+    }
+  } else if (format === 3) {
+    const entry = alpha ? 4 : 3, stride = (w + 3) & ~3, tb = table * entry; let o = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const b = data[tb + y * stride + x] * entry; const a = alpha ? data[b + 3] : 255;
+      rgba[o++] = alpha ? unpremultiply(data[b], a) : data[b]; rgba[o++] = alpha ? unpremultiply(data[b + 1], a) : data[b + 1]; rgba[o++] = alpha ? unpremultiply(data[b + 2], a) : data[b + 2]; rgba[o++] = a; }
+  }
+  return new ImageData(rgba, w, h);
+}
+async function swfPath(bytes, want) {
+  const f = await parseSwf(bytes);
+  const pre = f.doc + '_'; let n = 0;
+  const ids = new Set();
+  for (const [id, name] of f.symbols) if (f.bitmaps.has(id) && want(name.startsWith(pre) ? name.slice(pre.length) : name)) ids.add(id);
+  for (const id of ids) { await decodeLossless(f.bitmaps.get(id)); n++; }
+  return n;
+}
+
+// ---------------------------------------------------------------- PNG decode in JS (for the sync HAB variant)
+function paeth(a, b, c) { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); return pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
+async function decodePngJs(png) {
+  let pos = 8, w = 0, h = 0, type = 0, plte = null, trns = null; const idat = [];
+  while (pos < png.length) {
+    const len = be32(png, pos), kind = td.decode(png.subarray(pos + 4, pos + 8)), body = png.subarray(pos + 8, pos + 8 + len);
+    if (kind === 'IHDR') { w = be32(body, 0); h = be32(body, 4); type = body[9]; }
+    else if (kind === 'PLTE') plte = body; else if (kind === 'tRNS') trns = body; else if (kind === 'IDAT') idat.push(body);
+    pos += 12 + len;
+  }
+  let total = 0; for (const c of idat) total += c.length;
+  const z = new Uint8Array(total); let o = 0; for (const c of idat) { z.set(c, o); o += c.length; }
+  const raw = await inflate(z);
+  const bpp = type === 6 ? 4 : type === 2 ? 3 : 1, stride = w * bpp;
+  const cur = new Uint8Array(h * stride); let ip = 0;
+  for (let y = 0; y < h; y++) {
+    const f = raw[ip++], row = y * stride, prev = row - stride;
+    for (let x = 0; x < stride; x++) {
+      const v = raw[ip++], a = x >= bpp ? cur[row + x - bpp] : 0, b = y ? cur[prev + x] : 0, c = (x >= bpp && y) ? cur[prev + x - bpp] : 0;
+      cur[row + x] = f === 0 ? v : f === 1 ? v + a : f === 2 ? v + b : f === 3 ? v + ((a + b) >> 1) : v + paeth(a, b, c);
+    }
+  }
+  if (type === 6) return { w, h, rgba: cur };
+  const rgba = new Uint8Array(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    if (type === 2) { rgba[i * 4] = cur[i * 3]; rgba[i * 4 + 1] = cur[i * 3 + 1]; rgba[i * 4 + 2] = cur[i * 3 + 2]; rgba[i * 4 + 3] = 255; }
+    else { const k = cur[i]; rgba[i * 4] = plte[k * 3]; rgba[i * 4 + 1] = plte[k * 3 + 1]; rgba[i * 4 + 2] = plte[k * 3 + 2]; rgba[i * 4 + 3] = trns && k < trns.length ? trns[k] : 255; }
+  }
+  return { w, h, rgba };
+}
+function sliceRgba(img, fr) {
+  const out = new Uint8ClampedArray(fr.w * fr.h * 4);
+  for (let y = 0; y < fr.h; y++) out.set(img.rgba.subarray(((fr.y + y) * img.w + fr.x) * 4, ((fr.y + y) * img.w + fr.x + fr.w) * 4), y * fr.w * 4);
+  return new ImageData(out, fr.w, fr.h);
+}
+
+// ---------------------------------------------------------------- HAB path
+async function habPath(bytes, want, mode) {   // mode: 'native' (createImageBitmap) | 'js' (decode PNG in JS)
+  const stored = u32(bytes, 8);
+  const index = JSON.parse(td.decode(await inflate(bytes.subarray(20, 20 + stored))));
+  const payload = bytes.subarray(20 + stored);
+  const get = async e => { const b = payload.subarray(e.offset, e.offset + e.storedLength); return e.compression === 'deflate' ? inflate(b) : b; };
+  const jsonEntry = index.entries.find(e => e.mimeType === 'application/json');
+  const data = JSON.parse(td.decode(await get(jsonEntry)));
+  const man = index.entries.find(e => e.name === 'manifest');
+  if (man) parser.parseFromString(td.decode(await get(man)), 'text/xml');
+  const sheet = data.spritesheet; if (!sheet) return 0;
+  const pre = data.documentClass + '_';
+  const wanted = Object.entries(sheet.frames).filter(([name]) => want(name.startsWith(pre) ? name.slice(pre.length) : name));
+  const needed = new Set(wanted.map(([, fr]) => fr.image || sheet.meta.image));
+  const atlases = {};
+  for (const image of needed) {
+    const png = await get(index.entries.find(e => e.name === image));
+    if (mode === 'js') { atlases[image] = await decodePngJs(png); continue; }
+    const t = performance.now();
+    const bmp = await createImageBitmap(new Blob([png], { type: 'image/png' }), { premultiplyAlpha: 'none' });
+    offThread += performance.now() - t;
+    const c = new OffscreenCanvas(bmp.width, bmp.height); const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(bmp, 0, 0); bmp.close(); atlases[image] = g;
+  }
+  const seen = new Set(); let n = 0;
+  for (const [, fr] of wanted) {
+    const k = (fr.image || '') + fr.frame.x + ',' + fr.frame.y; if (seen.has(k)) continue; seen.add(k);
+    const a = atlases[fr.image || sheet.meta.image];
+    if (mode === 'js') sliceRgba(a, fr.frame); else a.getImageData(fr.frame.x, fr.frame.y, fr.frame.w, fr.frame.h);
+    n++;
+  }
+  return n;
+}
+
+// ---------------------------------------------------------------- harness
+const all = () => true;
+// "one view": what a room actually shows -- 64px direction 2 plus icons; figures: standing, direction 2
+const oneView = name => /_64_[a-z]+_2_/.test(name) || /_icon_/.test(name) || /^h_std_[a-z]+_\d+_2_\d+$/.test(name) || /^h_std_fx/.test(name);
+
+async function run() {
+  const files = await (await fetch('files.json')).json();
+  out.textContent = `files: ${files.length}`;
+  const data = {};
+  for (const kind of ['swf', 'full', 'sulake']) {
+    let bytes = 0;
+    data[kind] = [];
+    for (const f of files) {   // sequential with retry: python's http.server drops bursts of connections
+      let b = null;
+      for (let t = 0; t < 5 && !b; t++) { try { b = new Uint8Array(await (await fetch(`${kind}/${f.name}.${kind === 'swf' ? 'swf' : 'hab'}`)).arrayBuffer()); } catch (e) { await new Promise(r => setTimeout(r, 200)); } }
+      bytes += b.length; data[kind].push(b);
+    }
+    log(`${kind.padEnd(7)} bytes ${(bytes / 1e6).toFixed(2)} MB`);
+  }
+  const cases = [
+    ['SWF  one view   | SkyHaxe Haxe inflate', 'sky', i => swfPath(data.swf[i], oneView)],
+    ['SWF  one view   | pako inflate', 'pako', i => swfPath(data.swf[i], oneView)],
+    ['HAB full one    | native decode', 'sky', i => habPath(data.full[i], oneView, 'native')],
+    ['HAB full one    | JS PNG (Haxe inflate)', 'sky', i => habPath(data.full[i], oneView, 'js')],
+    ['HAB full one    | JS PNG (pako)', 'pako', i => habPath(data.full[i], oneView, 'js')],
+    ['HAB sulake one  | native decode', 'sky', i => habPath(data.sulake[i], oneView, 'native')],
+    ['SWF  all        | SkyHaxe Haxe inflate', 'sky', i => swfPath(data.swf[i], all)],
+    ['SWF  all        | pako inflate', 'pako', i => swfPath(data.swf[i], all)],
+    ['HAB full all    | native decode', 'sky', i => habPath(data.full[i], all, 'native')],
+    ['HAB full all    | JS PNG (Haxe inflate)', 'sky', i => habPath(data.full[i], all, 'js')],
+    ['HAB full all    | JS PNG (pako)', 'pako', i => habPath(data.full[i], all, 'js')],
+    ['HAB sulake all  | native decode', 'sky', i => habPath(data.sulake[i], all, 'native')],
+  ];
+  const extra = [
+    ['SWF  one view   | pako inflate', 'pako', i => swfPath(data.swf[i], oneView)],
+    ['HAB full one    | native + pako container', 'pako', i => habPath(data.full[i], oneView, 'native')],
+    ['HAB sulake one  | native + pako container', 'pako', i => habPath(data.sulake[i], oneView, 'native')],
+    ['SWF  all        | pako inflate', 'pako', i => swfPath(data.swf[i], all)],
+    ['HAB full all    | native + pako container', 'pako', i => habPath(data.full[i], all, 'native')],
+    ['HAB sulake all  | native + pako container', 'pako', i => habPath(data.sulake[i], all, 'native')],
+  ];
+  const selected = new URLSearchParams(location.search).has('extra') ? extra : cases;
+  const results = {};
+  for (let pass = 0; pass < 3; pass++) {
+    for (const [label, inf, fn] of selected) {
+      inflate = INFLATERS[inf]; offThread = 0;
+      const per = {}; let frames = 0;
+      const t0 = performance.now();
+      for (let i = 0; i < files.length; i++) {
+        const s = performance.now(); frames += await fn(i); const dt = performance.now() - s;
+        per[files[i].cat] = (per[files[i].cat] || 0) + dt;
+      }
+      const total = performance.now() - t0, main = total - offThread;
+      if (pass > 0) { const r = (results[label] ??= { total: 0, main: 0, frames, per: {} }); r.total += total / 2; r.main += main / 2; for (const k in per) r.per[k] = (r.per[k] || 0) + per[k] / 2; }
+      log(`pass ${pass} ${label.padEnd(40)} total ${total.toFixed(0).padStart(6)} ms  main-thread ${main.toFixed(0).padStart(6)} ms  frames ${frames}  ` + Object.entries(per).map(([k, v]) => `${k}:${v.toFixed(0)}`).join(' '));
+    }
+  }
+  document.documentElement.setAttribute('data-bench', JSON.stringify(results));
+  log('DONE');
+}
+run().catch(e => log('ERROR ' + e.stack));
+</script></body></html>
