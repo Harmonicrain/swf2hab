@@ -12,37 +12,65 @@ It also converts Nitro bundles (`.nitro`) into `.hab` (see [From .nitro](#from-n
   pet, effect and placeholder libraries), every JSON document matched and all 7,333 frames were
   pixel-identical, and the output was about 7% smaller. To repeat the check, see
   `tools/oracle_check.py`.
-- **Safe.** It only reads your SWFs (or .nitro bundles) and writes into a separate output folder.
+- **Safe.** It only reads your files and writes into a separate output folder.
 
 ## Install
 
 ```
-pip install .            # or just run it from this folder: python -m swf2hab ...
-pip install .[fast]      # optional: numpy + Pillow
+pip install .            # adds the `swf2hab` command
+pip install .[fast]      # the same plus numpy + Pillow: faster, smaller PNGs, same pixels
 ```
+
+Or run it without installing: `python -m swf2hab ...` from this folder. On Windows,
+double-click `swf2hab.cmd` for the step-by-step wizard. You can also run it from a command
+prompt with the same arguments as `swf2hab`.
 
 ## Use
 
+One command, `swf2hab`, with these subcommands:
+
+| Command | What it does |
+|---|---|
+| `convert` | Converts files or whole folders to `.hab` (default), `.swf` or `.nitro`. Inputs can be any mix of the three; each file's format is read from its content. |
+| `inspect` | Shows what is inside each file: library, kind, assets, frames, sizes, atlases. |
+| `extract` | Unpacks files into folders: every entry or symbol as PNG, XML or JSON, and every atlas frame as its own PNG. |
+| `verify` | Checks files load the way their client loads them: `.hab` like Habbo's HTML5 client, `.nitro` like Nitro, `.swf` like Habbo's AS3 loader. |
+| `compare` | Compares two files of any format, JSON and every frame's pixels. |
+| `wizard` | Asks what to convert, to what and where, then does it. |
+| `info` | Shows the version, the optional speed-ups and the supported conversions. |
+
 ```
-# one file
-python -m swf2hab convert throne.swf -o out/
+swf2hab convert throne.swf -o out/                         # one file
+swf2hab convert C:/habbo/dcr/hof_furni -o C:/habbo/hab/hof_furni --report furni.json
+swf2hab convert hab/ -o swf/ --to swf                      # back to Flash libraries
+swf2hab convert nitro-react/dist/bundled -o swf/ --to swf  # Nitro bundles to Flash
+swf2hab convert dcr/ -o nitro/ --to nitro --exclude "Habbo*.swf"
+swf2hab convert dcr/ -o hab/ --dry-run                     # list what would happen
 
-# whole folders; the folder structure is mirrored, nothing is written next to the SWFs
-python -m swf2hab convert C:/habbo/dcr/hof_furni -o C:/habbo/hab/dcr/hof_furni --report furni.json
-python -m swf2hab convert C:/habbo/gordon/PRODUCTION-... -o C:/habbo/hab/gordon/PRODUCTION-... \
-        --exclude Habbo.swf --exclude HabboAir.swf
-
-python -m swf2hab inspect throne.swf out/throne.hab     # what is inside
-python -m swf2hab unpack out/throne.hab -o throne/      # extract entries
-python -m swf2hab verify out/                           # validate like the client does
-python -m swf2hab compare mine.hab habbos.hab           # JSON + per-frame pixel diff
-
-python -m swf2hab export out/ --to swf -o swf/          # .hab (or .nitro) -> Flash asset library
-python -m swf2hab export bundled/ --to nitro -o nitro/  # .hab (or .swf) -> Nitro bundle
+swf2hab inspect throne.swf out/throne.hab throne.nitro     # -v lists entries, --json for scripts
+swf2hab extract out/throne.hab -o throne/                  # throne/frames/*.png and the raw entries
+swf2hab verify out/                                        # exit status 1 if anything is invalid
+swf2hab compare throne.swf out/throne.hab                  # any two formats
 ```
 
-The defaults are all CPU cores, incremental runs (a `.hab` newer than its `.swf` is skipped
-unless you pass `--force`), and atlases of at most 8192 px a side (`--max-atlas`).
+`convert`:
+
+- **Folders** are searched recursively and their structure is mirrored in the output folder.
+  Nothing is written next to your inputs.
+- **Runs are incremental.** A file whose output is newer is reported "up to date"; `--force`
+  converts it again.
+- **It runs on all cores but one** (`-j` to change).
+- **On a terminal you get a progress bar** with a live count and time left. Failed files are
+  listed as they happen, and a summary comes at the end.
+- **Machine-readable output.** `--json` prints the summary as JSON, and `--report` writes every
+  file's result, warnings included.
+- **Exit status** is 0 on success, 1 for a usage problem and 2 if any file failed. Ctrl+C stops
+  cleanly and keeps the files already written.
+
+Options that only make sense for one target are grouped under it in `swf2hab convert -h`.
+`--profile`, `--layout`, `--padding` and `--max-atlas` apply to `--to hab`; `--small` applies to
+`--to swf`. Atlases are at most 8192 px a side unless you change `--max-atlas`. `export` and
+`unpack`, the command names of earlier versions, still work.
 
 ### Profiles
 
@@ -66,8 +94,8 @@ unless you pass `--force`), and atlases of at most 8192 px a side (`--max-atlas`
 `convert` also accepts `.nitro` files and folders that contain them, mixed with SWFs if you like:
 
 ```
-python -m swf2hab convert nitro-react/dist/bundled -o hab/ --report nitro.json
-python -m swf2hab inspect throne.nitro          # list the files inside a .nitro
+swf2hab convert nitro-react/dist/bundled -o hab/ --report nitro.json
+swf2hab inspect throne.nitro          # what is inside a .nitro
 ```
 
 A `.nitro` (made by nitro-converter) already holds the JSON layout Habbo's `.hab` files use, plus
@@ -94,14 +122,14 @@ What a `.nitro` cannot give you:
 
 ## Back to .swf and .nitro
 
-`export` turns `.hab` bundles back into the two older formats. It also takes `.nitro` and `.swf`
-input, converting it to a `.hab` in memory first, so `.nitro` -> `.swf` and `.swf` -> `.nitro` work
-as well:
+`convert --to swf` and `convert --to nitro` turn `.hab` bundles back into the two older formats.
+A `.nitro` or `.swf` input is converted to a `.hab` in memory first, so `.nitro` -> `.swf` and
+`.swf` -> `.nitro` work as well:
 
 ```
-python -m swf2hab export hab/dcr/hof_furni -o dcr/hof_furni --to swf --report swf.json
-python -m swf2hab export nitro-react/dist/bundled -o swf/ --to swf
-python -m swf2hab export hab/ -o nitro/ --to nitro
+swf2hab convert hab/dcr/hof_furni -o dcr/hof_furni --to swf --report swf.json
+swf2hab convert nitro-react/dist/bundled -o swf/ --to swf
+swf2hab convert hab/ -o nitro/ --to nitro
 ```
 
 ### .swf

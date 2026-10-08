@@ -294,6 +294,91 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(out, doc)
 
 
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="swf2hab-test-")
+        self.src = os.path.join(self.tmp, "in")
+        os.makedirs(os.path.join(self.src, "sub"))
+        with open(os.path.join(self.src, "sub", "chair.swf"), "wb") as fh:
+            fh.write(make_swf())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        import contextlib
+        import io
+        from swf2hab import cli
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(list(args) + ["--no-color"])
+        return code, out.getvalue(), err.getvalue()
+
+    def path(self, *parts):
+        return os.path.join(self.tmp, *parts)
+
+    def test_convert_every_direction(self):
+        code, out, _ = self.run_cli("convert", self.src, "-o", self.path("hab"), "-j", "1")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.exists(self.path("hab", "sub", "chair.hab")))     # structure mirrored
+        self.assertIn("converted", out)
+        for target, source in (("swf", "hab"), ("nitro", "hab"), ("swf", "hab2nitro"), ("nitro", "in")):
+            code, out, _ = self.run_cli("convert", self.path(source), "-o", self.path(source + "2" + target),
+                                        "--to", target)
+            self.assertEqual(code, 0, out)
+            self.assertTrue(os.path.exists(self.path(source + "2" + target, "sub", "chair." + target)), out)
+        a = read_assets(open(self.path("hab2nitro2swf", "sub", "chair.swf"), "rb").read())
+        self.assertEqual(a.document_class, "chair")
+
+    def test_up_to_date_dry_run_and_json(self):
+        self.run_cli("convert", self.src, "-o", self.path("hab"))
+        code, out, _ = self.run_cli("convert", self.src, "-o", self.path("hab"), "--json")
+        summary = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual(summary["counts"], {"up-to-date": 1})
+        code, out, _ = self.run_cli("convert", self.src, "-o", self.path("dry"), "-n")
+        self.assertEqual(code, 0)
+        self.assertIn("chair.swf", out)
+        self.assertFalse(os.path.exists(self.path("dry")))
+
+    def test_option_checks(self):
+        code, _, err = self.run_cli("convert", self.src, "-o", self.path("x"), "--to", "swf", "--profile", "sulake")
+        self.assertEqual(code, 1)
+        self.assertIn("--profile only applies with --to hab", err)
+        code, _, err = self.run_cli("convert", self.src, "-o", self.src)
+        self.assertEqual(code, 1)
+        self.assertIn("must not be the input folder", err)
+
+    def test_inspect_extract_verify_compare(self):
+        swf = self.path("in", "sub", "chair.swf")
+        self.run_cli("convert", self.src, "-o", self.path("hab"))
+        hab_file = self.path("hab", "sub", "chair.hab")
+        code, out, _ = self.run_cli("inspect", swf, "--json")
+        info = json.loads(out)
+        self.assertEqual((info["format"], info["name"], info["kind"], info["bitmaps"]), ("swf", "chair", "furniture", 1))
+        code, out, _ = self.run_cli("inspect", hab_file)
+        self.assertIn("furniture", out)
+        code, out, _ = self.run_cli("extract", hab_file, swf, "-o", self.path("ex"))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.exists(self.path("ex", "chair-hab", "frames", "chair_chair_64_a_0_0.png")))
+        self.assertTrue(os.path.exists(self.path("ex", "chair-swf", "chair_64_a_0_0.png")))
+        self.assertTrue(os.path.exists(self.path("ex", "chair-swf", "manifest.xml")))
+        self.run_cli("convert", self.path("hab"), "-o", self.path("swf"), "--to", "swf")
+        code, out, _ = self.run_cli("verify", self.path("hab"), self.path("swf"))   # exports carry ActionScript
+        self.assertEqual(code, 0, out)
+        code, out, _ = self.run_cli("verify", swf)        # the hand-made test SWF has none: Flash could not load it
+        self.assertEqual(code, 1)
+        self.assertIn("not defined in the ActionScript", out)
+        with open(self.path("broken.hab"), "wb") as fh:
+            fh.write(open(hab_file, "rb").read()[:-5])
+        code, out, _ = self.run_cli("verify", self.path("broken.hab"))
+        self.assertEqual(code, 1)
+        code, out, _ = self.run_cli("compare", swf, hab_file)
+        self.assertEqual(code, 0, out)
+        self.assertIn("identical", out)
+
+
 class ImageTests(unittest.TestCase):
     def test_pure_png_decoder_reads_our_png_and_pillow_trap(self):
         from swf2hab import images

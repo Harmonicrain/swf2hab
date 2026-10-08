@@ -513,7 +513,10 @@ def export(data: bytes, target: str, source_name: str = "", small: str = "auto")
     if target not in TARGETS:
         raise ValueError("unknown target %r" % target)
     # .swf -> .nitro goes through the sulake profile: exactly what nitro-converter keeps
-    bundle, warnings = load(data, source_name, profile="sulake" if target == "nitro" else "full")
+    try:
+        bundle, warnings = load(data, source_name, profile="sulake" if target == "nitro" else "full")
+    except ExportError as nothing:        # e.g. a code-only SWF: nothing to export, not a failure
+        return ExportResult(None, "generic", source_name, skipped_reason=str(nothing))
     if target == "swf":
         return to_swf(bundle, small=small, warnings=warnings)
     return to_nitro(bundle, warnings=warnings)
