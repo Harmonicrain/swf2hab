@@ -14,6 +14,60 @@ It also converts Nitro bundles (`.nitro`) into `.hab` (see [From .nitro](#from-n
   `tools/oracle_check.py`.
 - **Safe.** It only reads your files and writes into a separate output folder.
 
+## How it works
+
+swf2hab works with three Habbo asset formats and converts between them in any direction:
+
+| Format | Used by |
+|---|---|
+| `.swf` | Habbo's Flash/AIR client (and clients that run its AS3 code, such as SkyHaxe) |
+| `.hab` | Habbo's HTML5 client |
+| `.nitro` | Nitro |
+
+You point it at a file or a folder, choose the format you want, and choose an output folder. It
+reads every `.swf`, `.hab` and `.nitro` it finds, working out each file's format from its
+content. It writes the converted files into the output folder, with the same subfolders as the
+input. Your original files are never changed.
+
+### Quick start (Windows, no typing)
+
+1. Install [Python](https://www.python.org/downloads/) 3.9 or newer, ticking "Add python.exe to
+   PATH".
+2. Download this repository and double-click **`swf2hab.cmd`**.
+3. Answer the questions:
+   - **File or folder to convert:** drag it into the window and press Enter.
+   - **Convert to:** `1` for `.hab`, `2` for `.swf`, `3` for `.nitro`.
+   - **Output folder:** press Enter for the suggested one, or type your own.
+   - **Convert?** Press Enter.
+4. When it says **Done**, the converted files are in the output folder.
+
+### Quick start (command line)
+
+The pattern is always: **what to convert**, `-o` **where to put it**, `--to` **which format**.
+Leave out `--to` and you get `.hab`.
+
+```
+swf2hab convert C:/habbo/dcr/hof_furni -o C:/out/hab                # .swf/.nitro -> .hab
+swf2hab convert C:/out/hab -o C:/out/swf --to swf                   # .hab/.nitro -> .swf
+swf2hab convert nitro-react/dist/bundled -o C:/out/swf --to swf     # .nitro -> .swf
+swf2hab convert C:/out/hab -o C:/out/nitro --to nitro               # .hab/.swf -> .nitro
+```
+
+Not installed with pip? Use `python -m swf2hab` from this folder, or `swf2hab.cmd` on Windows,
+in place of `swf2hab`. `swf2hab <command> -h` explains every option, and `swf2hab info` lists
+the supported conversions.
+
+### What each conversion gives you
+
+- **To `.hab`:** furni, pets, figure parts, effects and room content. The `full` profile (the
+  default) keeps everything; `--profile sulake` keeps only what Habbo itself ships (see
+  [Profiles](#profiles)).
+- **To `.swf`:** a library Habbo's Flash/AIR client loads like any of Habbo's own. If the input
+  has no 32px art (Habbo's `.hab` files, anything made from a `.nitro`), half-size art is
+  generated so furni do not look huge when zoomed out. `--small none` turns that off.
+- **To `.nitro`:** furni, pets, figure parts and effects, without 32px art, which Nitro does not
+  use. Room content and UI libraries are skipped, because Nitro has no equivalent for them.
+
 ## Install
 
 ```
@@ -66,6 +120,14 @@ swf2hab compare throne.swf out/throne.hab                  # any two formats
   file's result, warnings included.
 - **Exit status** is 0 on success, 1 for a usage problem and 2 if any file failed. Ctrl+C stops
   cleanly and keeps the files already written.
+
+**Folders with a mix of formats.** Every file that is not already in the target format is
+converted. Files that already are, such as `.hab` files in a `--to hab` run, are left alone and
+are not copied to the output folder. When two inputs would produce the same output (say
+`throne.swf` and `throne.nitro` both making `throne.hab`), only the first one in alphabetical
+order is converted, and the other is listed as "same output as ..., left out". Keep one
+source per asset in a folder, or prefer the `.swf`, which carries the most (32px art and the
+original XML).
 
 Options that only make sense for one target are grouped under it in `swf2hab convert -h`.
 `--profile`, `--layout`, `--padding` and `--max-atlas` apply to `--to hab`; `--small` applies to
