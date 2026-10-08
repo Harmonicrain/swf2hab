@@ -2,6 +2,7 @@
 
 Converts Habbo Flash asset libraries (`.swf`) into `.hab` bundles, the format Habbo's own HTML5
 client loads instead of SWFs. That covers furni, pets, figure parts, effects and room content.
+It also converts Nitro bundles (`.nitro`) into `.hab` (see [From .nitro](#from-nitro)).
 
 - **Standalone.** Python 3.9+ standard library only. Installing `numpy` and `Pillow` makes it
   faster and the PNGs smaller, but the decoded pixels are the same either way.
@@ -10,7 +11,7 @@ client loads instead of SWFs. That covers furni, pets, figure parts, effects and
   pet, effect and placeholder libraries), every JSON document matched and all 7,333 frames were
   pixel-identical, and the output was about 7% smaller. To repeat the check, see
   `tools/oracle_check.py`.
-- **Safe.** It only reads your SWFs and writes into a separate output folder.
+- **Safe.** It only reads your SWFs (or .nitro bundles) and writes into a separate output folder.
 
 ## Install
 
@@ -55,6 +56,37 @@ unless you pass `--force`), and atlases of at most 8192 px a side (`--max-atlas`
   bitmap, MP3). Habbo uses this for room content such as `HabboRoomContent` and for UI
   libraries. `auto` uses it for room content (`visualization="room"`) and for SWFs that have no
   Habbo manifest.
+
+## From .nitro
+
+`convert` also accepts `.nitro` files and folders that contain them, mixed with SWFs if you like:
+
+```
+python -m swf2hab convert nitro-react/dist/bundled -o hab/ --report nitro.json
+python -m swf2hab inspect throne.nitro          # list the files inside a .nitro
+```
+
+A `.nitro` (made by nitro-converter) already holds the JSON layout Habbo's `.hab` files use, plus
+its atlas PNG, so it is repackaged rather than re-rendered: the PNG is copied byte for byte. Two
+changes make the JSON match Habbo's: `documentClass` is added (the bundle name), and effect and
+figure libraries drop `name`, which Habbo's JSON for those does not have. Entries compressed with
+zlib or gzip are both read.
+
+Checked against SWF conversions of the same assets with `--profile sulake`: JSON identical and
+every frame pixel-identical (furni, pets, effects, figure parts). All 19,959 bundles of a full
+nitro-react asset set convert and validate, in about 20 seconds.
+
+What a `.nitro` cannot give you:
+
+- **Only what nitro-converter kept**, which matches the `sulake` profile: no 32px art, no `sh_`
+  figure parts, no raw XML/binary symbols, and no separate pet palette entries. Converting the
+  original `.swf` with the `full` profile keeps all of that. `--profile`, `--layout` and
+  `--max-atlas` do not apply to `.nitro` input.
+- **Older "generic" bundles** (`tile_cursor`, `place_holder` and similar) use nitro-converter's
+  own schema (`type`, `dimensions`, `directions`). They are repackaged unchanged and the report
+  carries a warning; Habbo's own files for those use a different layout.
+- **The artwork is whatever the bundle was built from.** If a `.nitro` came from a different
+  release of an asset than your SWFs, the pixels differ accordingly.
 
 ## The .hab format
 

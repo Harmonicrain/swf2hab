@@ -132,5 +132,62 @@ class PackerTests(unittest.TestCase):
             self.assertLessEqual(max(w, h), 256)
 
 
+
+def make_nitro(files, gzip_files=()):
+    """A .nitro bundle as nitro-converter writes it (big-endian, zlib or gzip per file)."""
+    out = struct.pack(">H", len(files))
+    for name, data in files.items():
+        if name in gzip_files:
+            c = zlib.compressobj(9, zlib.DEFLATED, 31)
+            packed = c.compress(data) + c.flush()
+        else:
+            packed = zlib.compress(data)
+        raw = name.encode()
+        out += struct.pack(">H", len(raw)) + raw + struct.pack(">I", len(packed)) + packed
+    return out
+
+
+TINY_PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+            b"\x00\x00\x00\rIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82")
+
+
+class NitroTests(unittest.TestCase):
+    def sheet(self):
+        return {"frames": {"x_x_64_a_0_0": {"frame": {"x": 0, "y": 0, "w": 1, "h": 1}, "rotated": False,
+                                            "trimmed": False, "spriteSourceSize": {"x": 0, "y": 0, "w": 1, "h": 1},
+                                            "sourceSize": {"w": 1, "h": 1}, "pivot": {"x": 0.5, "y": 0.5}}},
+                "meta": {"image": "x.png", "format": "RGBA8888", "size": {"w": 1, "h": 1}, "scale": 1}}
+
+    def test_furni_gets_document_class_before_spritesheet(self):
+        from swf2hab import nitro
+        doc = {"name": "x", "logicType": "furniture_basic", "visualizationType": "furniture_static",
+               "assets": {}, "logic": {}, "visualizations": [], "spritesheet": self.sheet()}
+        result = nitro.convert(make_nitro({"x.json": json.dumps(doc).encode(), "x.png": TINY_PNG}), "x.nitro")
+        bundle = hab.read(result.data)
+        self.assertEqual(bundle.name, "x")
+        self.assertEqual([e.name for e in bundle.entries], ["x.json", "x.png"])
+        out = json.loads(bundle.get("x.json").data)
+        keys = list(out)
+        self.assertEqual(keys.index("documentClass") + 1, keys.index("spritesheet"))
+        self.assertEqual(out["documentClass"], "x")
+        self.assertEqual(out["name"], "x")
+        self.assertEqual(bundle.get("x.png").data, TINY_PNG)
+        self.assertEqual((result.kind, result.frames, result.atlas), ("furniture", 1, (1, 1)))
+
+    def test_library_name_becomes_document_class_and_gzip_is_read(self):
+        from swf2hab import nitro
+        doc = {"assets": {}, "name": "hh_test", "spritesheet": self.sheet()}
+        data = make_nitro({"hh_test.json": json.dumps(doc).encode(), "x.png": TINY_PNG}, gzip_files={"x.png"})
+        out = json.loads(hab.read(nitro.convert(data, "hh_test.nitro").data).get("hh_test.json").data)
+        self.assertNotIn("name", out)
+        self.assertEqual(out["documentClass"], "hh_test")
+
+    def test_truncated_bundle_is_rejected(self):
+        from swf2hab import nitro
+        data = make_nitro({"x.json": b"{}"})
+        with self.assertRaises(nitro.NitroError):
+            nitro.read(data[:-3])
+
+
 if __name__ == "__main__":
     unittest.main()

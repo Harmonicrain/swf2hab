@@ -10,18 +10,20 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from . import __version__, compare, convert, hab, images
+from . import __version__, compare, convert, hab, images, nitro
+
+INPUT_SUFFIXES = (".swf", ".nitro")
 
 
 def _collect(inputs: list[str], excludes: list[str]) -> list[tuple[str, str]]:
-    """(absolute path, path relative to its input root) for every .swf to convert."""
+    """(absolute path, path relative to its input root) for every .swf or .nitro to convert."""
     found = []
     for item in inputs:
         if os.path.isdir(item):
             for root, dirs, files in os.walk(item):
                 dirs.sort()
                 for f in sorted(files):
-                    if f.lower().endswith(".swf"):
+                    if f.lower().endswith(INPUT_SUFFIXES):
                         full = os.path.join(root, f)
                         found.append((full, os.path.relpath(full, item)))
         elif os.path.isfile(item):
@@ -42,8 +44,13 @@ def _job(args: tuple) -> dict:
         t = time.perf_counter()
         with open(src, "rb") as fh:
             data = fh.read()
-        result = convert.convert(data, profile=profile, source_name=src, padding=padding, layout=layout,
-                                 max_atlas=max_atlas)
+        if src.lower().endswith(".nitro"):
+            # A .nitro already holds Habbo-layout JSON plus its atlas; profile, layout and atlas
+            # options do not apply (see swf2hab/nitro.py).
+            result = nitro.convert(data, source_name=src)
+        else:
+            result = convert.convert(data, profile=profile, source_name=src, padding=padding, layout=layout,
+                                     max_atlas=max_atlas)
         rec.update(kind=result.kind, layout=result.layout, document_class=result.document_class, images=result.images,
                    frames=result.frames, atlas=list(result.atlas), warnings=result.warnings)
         if result.data is None:
@@ -64,7 +71,7 @@ def _job(args: tuple) -> dict:
 def cmd_convert(ns) -> int:
     files = _collect(ns.inputs, ns.exclude)
     if not files:
-        print("no .swf files found", file=sys.stderr)
+        print("no .swf or .nitro files found", file=sys.stderr)
         return 1
     jobs = []
     for src, rel in files:
@@ -113,6 +120,11 @@ def cmd_inspect(ns) -> int:
             print("%s: hab name=%s entries=%d meta=%s" % (path, b.name, len(b.entries), sorted(b.metadata)))
             for e in b.entries:
                 print("  %-48s %-28s %9d" % (e.name, e.mime, len(e.data)))
+        elif path.lower().endswith(".nitro"):
+            files = nitro.read(data)
+            print("%s: nitro files=%d" % (path, len(files)))
+            for name, content in files.items():
+                print("  %-48s %9d" % (name, len(content)))
         else:
             from .swf import TAG_NAMES, read_assets
             a = read_assets(data)
@@ -166,7 +178,7 @@ def cmd_compare(ns) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="swf2hab", description="Convert Habbo .swf asset libraries to .hab bundles.")
+    p = argparse.ArgumentParser(prog="swf2hab", description="Convert Habbo .swf asset libraries and Nitro .nitro bundles to .hab bundles.")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="command", required=True)
 
