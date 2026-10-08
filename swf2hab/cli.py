@@ -10,20 +10,21 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from . import __version__, compare, convert, hab, images, nitro
+from . import __version__, compare, convert, export, hab, images, nitro
 
 INPUT_SUFFIXES = (".swf", ".nitro")
+EXPORT_SUFFIXES = (".hab", ".nitro", ".swf")
 
 
-def _collect(inputs: list[str], excludes: list[str]) -> list[tuple[str, str]]:
-    """(absolute path, path relative to its input root) for every .swf or .nitro to convert."""
+def _collect(inputs: list[str], excludes: list[str], suffixes: tuple = INPUT_SUFFIXES) -> list[tuple[str, str]]:
+    """(absolute path, path relative to its input root) for every input file to convert."""
     found = []
     for item in inputs:
         if os.path.isdir(item):
             for root, dirs, files in os.walk(item):
                 dirs.sort()
                 for f in sorted(files):
-                    if f.lower().endswith(INPUT_SUFFIXES):
+                    if f.lower().endswith(suffixes):
                         full = os.path.join(root, f)
                         found.append((full, os.path.relpath(full, item)))
         elif os.path.isfile(item):
@@ -111,6 +112,79 @@ def cmd_convert(ns) -> int:
     return 0 if counts.get("failed", 0) == 0 else 2
 
 
+def _export_job(args: tuple) -> dict:
+    src, dest, target, small, force = args
+    rec = {"source": src, "output": dest, "bytes_in": os.path.getsize(src)}
+    try:
+        if not force and os.path.exists(dest) and os.path.getmtime(dest) >= os.path.getmtime(src):
+            rec.update(status="up-to-date", bytes_out=os.path.getsize(dest))
+            return rec
+        t = time.perf_counter()
+        with open(src, "rb") as fh:
+            data = fh.read()
+        result = export.export(data, target, source_name=src, small=small)
+        rec.update(kind=result.kind, name=result.name, symbols=result.symbols, warnings=result.warnings)
+        if result.data is None:
+            rec.update(status="skipped", reason=result.skipped_reason)
+        else:
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            tmp = dest + ".tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(result.data)
+            os.replace(tmp, dest)
+            rec.update(status="ok", bytes_out=len(result.data))
+        rec["seconds"] = round(time.perf_counter() - t, 3)
+    except Exception as exc:
+        rec.update(status="failed", error="%s: %s" % (type(exc).__name__, exc))
+    return rec
+
+
+def cmd_export(ns) -> int:
+    suffix = "." + ns.to
+    files = [(p, r) for p, r in _collect(ns.inputs, ns.exclude, EXPORT_SUFFIXES) if not p.lower().endswith(suffix)]
+    if not files:
+        print("no .hab, .nitro or .swf files to export to %s" % suffix, file=sys.stderr)
+        return 1
+    jobs, taken = [], {}
+    for src, rel in files:
+        dest = os.path.join(ns.output, os.path.splitext(rel)[0] + suffix)
+        key = os.path.normcase(os.path.abspath(dest))
+        if key in taken:
+            print("[skipped] %s: same output as %s" % (src, taken[key]), file=sys.stderr)
+            continue
+        taken[key] = src
+        jobs.append((src, dest, ns.to, ns.small, ns.force))
+    print("swf2hab %s: exporting %d files to %s, jobs=%d" % (__version__, len(jobs), suffix, ns.jobs))
+    started = time.perf_counter()
+    records, counts = [], {}
+    if ns.jobs <= 1:
+        iterator = (_export_job(j) for j in jobs)
+    else:
+        pool = ProcessPoolExecutor(max_workers=ns.jobs)
+        iterator = (f.result() for f in as_completed([pool.submit(_export_job, j) for j in jobs]))
+    for n, rec in enumerate(iterator, 1):
+        records.append(rec)
+        counts[rec["status"]] = counts.get(rec["status"], 0) + 1
+        if rec["status"] in ("failed", "skipped") or ns.verbose:
+            print("[%s] %s %s" % (rec["status"], rec["source"], rec.get("error", rec.get("reason", ""))))
+            for w in rec.get("warnings") or [] if ns.verbose else []:
+                print("    warning:", w)
+        if n % 500 == 0 or n == len(jobs):
+            print("  %d/%d  %s  %.0fs" % (n, len(jobs), counts, time.perf_counter() - started), flush=True)
+    if ns.jobs > 1:
+        pool.shutdown()
+    summary = {"files": len(records), "counts": counts, "target": ns.to,
+               "bytes_in": sum(r["bytes_in"] for r in records if r["status"] in ("ok", "up-to-date")),
+               "bytes_out": sum(r.get("bytes_out", 0) for r in records if r["status"] in ("ok", "up-to-date")),
+               "seconds": round(time.perf_counter() - started, 1), "version": __version__}
+    print(json.dumps(summary))
+    if ns.report:
+        os.makedirs(os.path.dirname(os.path.abspath(ns.report)), exist_ok=True)
+        with open(ns.report, "w", encoding="utf-8") as fh:
+            json.dump({"summary": summary, "files": sorted(records, key=lambda r: r["source"])}, fh, indent=1)
+    return 0 if counts.get("failed", 0) == 0 else 2
+
+
 def cmd_inspect(ns) -> int:
     for path in ns.files:
         with open(path, "rb") as fh:
@@ -132,9 +206,28 @@ def cmd_inspect(ns) -> int:
                   % (path, a.version, a.document_class, len(a.symbols), len(a.bitmaps), len(a.binaries),
                      len(a.sounds), a.abc_bytes))
             print("  tags:", {TAG_NAMES.get(k, k): v for k, v in sorted(a.tag_counts.items())})
+            classes = _abc_classes(data)
+            if classes:
+                print("  classes: %d, document class extends %s" % (len(classes), classes.get(a.document_class, "?")))
             for w in a.warnings:
                 print("  warning:", w)
     return 0
+
+
+def _abc_classes(data: bytes) -> dict:
+    """Class name -> superclass for every DoABC block in a SWF."""
+    from .abc import read_abc
+    from .swf import decompress, iter_tags
+    out = {}
+    try:
+        for code, body in iter_tags(decompress(data)):
+            if code in (72, 82):
+                abc = body if code == 72 else body[body.index(b"\0", 4) + 1:]
+                for c in read_abc(abc).classes:
+                    out[c.name] = c.super_name
+    except Exception:
+        pass
+    return out
 
 
 def cmd_unpack(ns) -> int:
@@ -178,7 +271,7 @@ def cmd_compare(ns) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="swf2hab", description="Convert Habbo .swf asset libraries and Nitro .nitro bundles to .hab bundles.")
+    p = argparse.ArgumentParser(prog="swf2hab", description="Convert Habbo .swf asset libraries and Nitro .nitro bundles to .hab bundles, and back.")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -202,7 +295,22 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("-v", "--verbose", action="store_true")
     c.set_defaults(fn=cmd_convert)
 
-    i = sub.add_parser("inspect", help="describe a .swf or .hab")
+    e = sub.add_parser("export", help="turn .hab files (or .nitro / .swf) into .swf or .nitro")
+    e.add_argument("inputs", nargs="+")
+    e.add_argument("--to", choices=export.TARGETS, required=True,
+                   help="swf: a Flash asset library Habbo's AS3 client loads; nitro: a Nitro bundle")
+    e.add_argument("-o", "--output", required=True, help="output folder (never the input folder)")
+    e.add_argument("--small", choices=export.SMALL_MODES, default="auto",
+                   help="auto: give furni and pets without 32px art a generated half-size set, so a "
+                        "zoomed-out Flash room does not draw them at double size (default); none: leave it out")
+    e.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    e.add_argument("--exclude", action="append", default=[], help="glob on file name or relative path; repeatable")
+    e.add_argument("--force", action="store_true", help="re-export even if the output is newer than the input")
+    e.add_argument("--report", help="write a JSON report of every file")
+    e.add_argument("-v", "--verbose", action="store_true")
+    e.set_defaults(fn=cmd_export)
+
+    i = sub.add_parser("inspect", help="describe a .swf, .nitro or .hab")
     i.add_argument("files", nargs="+")
     i.set_defaults(fn=cmd_inspect)
 
@@ -221,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     k.set_defaults(fn=cmd_compare)
 
     ns = p.parse_args(argv)
-    if ns.command == "convert":
+    if ns.command in ("convert", "export"):
         out = os.path.abspath(ns.output)
         for item in ns.inputs:
             src = os.path.abspath(item)

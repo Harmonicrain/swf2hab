@@ -1,4 +1,4 @@
-"""Nitro bundle (.nitro) -> .hab bundle.
+"""Nitro bundle (.nitro) -> .hab bundle (export.py goes the other way, using `write`).
 
 A .nitro file (written by nitro-converter, read by nitro-renderer's NitroBundle) is
 
@@ -64,6 +64,18 @@ def read(data: bytes) -> dict[str, bytes]:
     return files
 
 
+def write(files: list[tuple[str, bytes]], level: int = 9) -> bytes:
+    """A .nitro bundle of (name, data) files, each zlib-compressed as nitro-converter writes them."""
+    if len(files) > 0xFFFF:
+        raise NitroError("too many files for a .nitro bundle")
+    out = bytearray(struct.pack(">H", len(files)))
+    for name, data in files:
+        raw = name.encode("utf-8")
+        packed = zlib.compress(data, level)
+        out += struct.pack(">H", len(raw)) + raw + struct.pack(">I", len(packed)) + packed
+    return bytes(out)
+
+
 def _inflate(packed: bytes, name: str) -> bytes:
     try:
         return zlib.decompress(packed, 47)   # zlib or gzip, as pako.inflate accepts
@@ -109,7 +121,7 @@ def convert(data: bytes, source_name: str = "") -> Result:
     doc = json.loads(files[json_names[0]].decode("utf-8"))
     if not isinstance(doc, dict):
         raise NitroError("JSON document is not an object")
-    document_class = doc.get("name") or os.path.splitext(json_names[0])[0] or stem
+    document_class = doc.get("name") or json_names[0][:-len(".json")] or stem or "library"
     habbo, kind = _habbo_json(doc, document_class)
 
     bundle = hab.Bundle(document_class)

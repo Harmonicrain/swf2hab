@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<application xmlns="http://ns.adobe.com/air/application/51.3">
+    <id>swf2hab.harness</id>
+    <filename>Harness</filename>
+    <versionNumber>1.0.0</versionNumber>
+    <initialWindow>
+        <content>Harness.swf</content>
+        <visible>false</visible>
+    </initialWindow>
+</application>

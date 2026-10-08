@@ -18,18 +18,17 @@ def _frames(bundle: hab.Bundle, data: dict) -> dict[str, tuple[int, int, bytes]]
     sheet = data.get("spritesheet") if data else None
     if not sheet:
         return {}
-    png = bundle.get(sheet["meta"]["image"])
-    if png is None:
-        return {}
-    aw, ah, atlas = images.decode_png_rgba(png.data)
+    atlases = {}
     out = {}
     for name, f in sheet["frames"].items():
-        fr, sss, src = f["frame"], f["spriteSourceSize"], f["sourceSize"]
-        w, h = src["w"], src["h"]
-        canvas = bytearray(w * h * 4)
-        piece = images.crop(atlas, aw, fr["x"], fr["y"], fr["w"], fr["h"])
-        images.blit(canvas, w, piece, fr["w"], fr["h"], sss["x"], sss["y"])
-        out[name] = (w, h, bytes(canvas))
+        image = f.get("image") or sheet["meta"]["image"]   # frames outside the main atlas name theirs
+        if image not in atlases:
+            png = bundle.get(image)
+            atlases[image] = images.decode_png_rgba(png.data) if png is not None else None
+        if atlases[image] is None:
+            continue
+        aw, ah, atlas = atlases[image]
+        out[name] = images.cut_frame(atlas, aw, f)
     return out
 
 

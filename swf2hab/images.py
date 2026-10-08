@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import math
+import re
 import struct
 import zlib
 
@@ -186,6 +187,32 @@ def crop(rgba: bytes, w: int, x: int, y: int, cw: int, ch: int) -> bytes:
     return b"".join(rgba[(y + r) * stride + x * 4:(y + r) * stride + (x + cw) * 4] for r in range(ch))
 
 
+def cut_frame(atlas: bytes, atlas_w: int, frame: dict) -> tuple[int, int, bytes]:
+    """A spritesheet frame at its source size: trimmed border restored, rotation undone.
+
+    Follows the TexturePacker JSON layout the bundles use: `frame` gives the sprite's size before
+    rotation, and a rotated sprite is stored turned 90 degrees clockwise.
+    """
+    fr = frame["frame"]
+    fw, fh = fr["w"], fr["h"]
+    if frame.get("rotated"):
+        turned = crop(atlas, atlas_w, fr["x"], fr["y"], fh, fw)
+        piece = bytearray(fw * fh * 4)
+        for y in range(fh):
+            for x in range(fw):
+                o = (x * fh + (fh - 1 - y)) * 4
+                piece[(y * fw + x) * 4:(y * fw + x) * 4 + 4] = turned[o:o + 4]
+        piece = bytes(piece)
+    else:
+        piece = crop(atlas, atlas_w, fr["x"], fr["y"], fw, fh)
+    sss, src = frame.get("spriteSourceSize"), frame.get("sourceSize")
+    if not sss or not src or (sss["x"], sss["y"], src["w"], src["h"]) == (0, 0, fw, fh):
+        return fw, fh, piece
+    canvas = bytearray(src["w"] * src["h"] * 4)
+    blit(canvas, src["w"], piece, fw, fh, sss["x"], sss["y"])
+    return src["w"], src["h"], bytes(canvas)
+
+
 def blit(atlas: bytearray, atlas_w: int, src: bytes, sw: int, sh: int, dx: int, dy: int) -> None:
     astride = atlas_w * 4
     sstride = sw * 4
@@ -225,9 +252,34 @@ def _palette_png(rgba: bytes, w: int, h: int) -> bytes | None:
     rows[:, 0] = 0
     rows[:, 1:] = idx
     extra = [_chunk(b"PLTE", plte)]
-    if trns.rstrip(b"\xff"):
-        extra.append(_chunk(b"tRNS", trns.rstrip(b"\xff")))
+    short = trns.rstrip(b"\xff")
+    if short:
+        # Keep the trailing opaque entries when the shortened table would hit Pillow's misreading
+        # (see _pillow_misreads_trns).
+        extra.append(_chunk(b"tRNS", trns if _pillow_misreads_trns(short) else short))
     return _png(w, h, 3, rows.tobytes(), extra)
+
+
+def _pillow_misreads_trns(trns: bytes) -> bool:
+    """Pillow reads a palette tRNS matching ^\\xff*\\x00\\xff*$ as "one transparent index". Python's
+    `$` also matches before a final newline, so a table ending in alpha 10 (0x0A), e.g. 00 0A, is
+    read that way too and every alpha-10 entry comes out opaque."""
+    return bool(re.match(rb"^\xff*\x00\xff*$", trns)) and not re.fullmatch(rb"\xff*\x00\xff*", trns)
+
+
+def _palette_trns(data: bytes) -> bytes | None:
+    """The tRNS chunk of a palette PNG, else None."""
+    if data[25:26] != b"\x03":
+        return None
+    pos = 8
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack_from(">I4s", data, pos)
+        if kind == b"tRNS":
+            return data[pos + 8:pos + 8 + length]
+        if kind in (b"IDAT", b"IEND"):
+            return None
+        pos += 12 + length
+    return None
 
 
 def encode_png(rgba: bytes, w: int, h: int) -> bytes:
@@ -248,8 +300,161 @@ def encode_png(rgba: bytes, w: int, h: int) -> bytes:
 
 
 def decode_png_rgba(data: bytes) -> tuple[int, int, bytes]:
-    """Decode a PNG to RGBA (Pillow required); used by the comparison tooling only."""
-    if PILImage is None:
-        raise RuntimeError("Pillow is required to decode PNG files")
-    im = PILImage.open(io.BytesIO(data)).convert("RGBA")
-    return im.size[0], im.size[1], im.tobytes()
+    """Decode a PNG to straight RGBA: Pillow when installed, else the standard-library decoder."""
+    if PILImage is not None:
+        trns = _palette_trns(data)
+        if trns is None or not _pillow_misreads_trns(trns):
+            im = PILImage.open(io.BytesIO(data)).convert("RGBA")
+            return im.size[0], im.size[1], im.tobytes()
+    return _decode_png_pure(data)
+
+
+def _decode_png_pure(data: bytes) -> tuple[int, int, bytes]:
+    """Non-interlaced PNGs of every colour type, 1-16 bits per sample (16-bit keeps the high byte)."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG file")
+    pos, idat, palette, trns = 8, [], b"", b""
+    w = h = depth = ctype = interlace = None
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack_from(">I4s", data, pos)
+        body = data[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if kind == b"IHDR":
+            w, h, depth, ctype, _, _, interlace = struct.unpack(">IIBBBBB", body)
+        elif kind == b"PLTE":
+            palette = body
+        elif kind == b"tRNS":
+            trns = body
+        elif kind == b"IDAT":
+            idat.append(body)
+        elif kind == b"IEND":
+            break
+    if w is None:
+        raise ValueError("PNG has no IHDR")
+    if interlace:
+        raise ValueError("interlaced PNGs need Pillow (pip install Pillow)")
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
+    bits = channels * depth
+    bpp = max(1, bits // 8)
+    stride = (w * bits + 7) // 8
+    raw = zlib.decompress(b"".join(idat))
+    rows = []
+    prev = bytearray(stride)
+    for y in range(h):
+        f = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        if f == 1:
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 0xFF
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 0xFF
+        elif f == 3:
+            for i in range(stride):
+                left = line[i - bpp] if i >= bpp else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 0xFF
+        elif f != 0:
+            raise ValueError("bad PNG filter %d" % f)
+        rows.append(bytes(line))
+        prev = line
+    out = bytearray(w * h * 4)
+    if depth < 8:
+        mask = (1 << depth) - 1
+        scale = 255 // mask
+        grey_key = struct.unpack(">H", trns[:2])[0] if ctype == 0 and len(trns) >= 2 else None
+        for y, line in enumerate(rows):
+            for x in range(w):
+                bit = x * depth
+                v = (line[bit >> 3] >> (8 - depth - (bit & 7))) & mask
+                o = (y * w + x) * 4
+                if ctype == 3:
+                    out[o:o + 3] = palette[v * 3:v * 3 + 3]
+                    out[o + 3] = trns[v] if v < len(trns) else 255
+                else:
+                    g = v * scale
+                    out[o:o + 4] = bytes((g, g, g, 0 if v == grey_key else 255))
+        return w, h, bytes(out)
+    step = depth // 8
+    key = None
+    if trns and ctype in (0, 2):
+        key = tuple(struct.unpack(">%dH" % (len(trns) // 2), trns))
+    for y, line in enumerate(rows):
+        samples = line[::step] if step > 1 else line      # high byte of 16-bit samples
+        full = line if step > 1 else None
+        for x in range(w):
+            s = samples[x * channels:(x + 1) * channels]
+            o = (y * w + x) * 4
+            if ctype == 6:
+                out[o:o + 4] = s
+            elif ctype == 3:
+                out[o:o + 3] = palette[s[0] * 3:s[0] * 3 + 3]
+                out[o + 3] = trns[s[0]] if s[0] < len(trns) else 255
+            elif ctype == 4:
+                out[o:o + 4] = bytes((s[0], s[0], s[0], s[1]))
+            else:
+                if full is not None:
+                    value = struct.unpack_from(">%dH" % channels, full, x * channels * 2)
+                else:
+                    value = tuple(s)
+                out[o:o + 3] = s if ctype == 2 else bytes((s[0], s[0], s[0]))
+                out[o + 3] = 0 if value == key else 255
+    return w, h, bytes(out)
+
+
+def rgba_to_argb_premultiplied(rgba: bytes, w: int, h: int) -> bytes:
+    """Straight RGBA -> DefineBitsLossless2 format 5 (premultiplied ARGB).
+
+    Rounds c * a / 255 to nearest, the exact inverse of argb_premultiplied_to_rgba: pixels read
+    from a Habbo SWF come back bit-identical.
+    """
+    n = w * h
+    if np is not None:
+        arr = np.frombuffer(rgba, dtype=np.uint8, count=n * 4).reshape(n, 4).astype(np.uint32)
+        out = np.empty((n, 4), dtype=np.uint8)
+        out[:, 0] = arr[:, 3]
+        out[:, 1:4] = (2 * arr[:, 0:3] * arr[:, 3:4] + 255) // 510
+        return out.tobytes()
+    out = bytearray(n * 4)
+    for i in range(n):
+        j = i * 4
+        r, g, b, a = rgba[j:j + 4]
+        if a == 255:
+            out[j:j + 4] = bytes((255, r, g, b))
+        elif a:
+            out[j:j + 4] = bytes((a, (2 * r * a + 255) // 510, (2 * g * a + 255) // 510, (2 * b * a + 255) // 510))
+    return bytes(out)
+
+
+def downscale_half(rgba: bytes, w: int, h: int) -> tuple[int, int, bytes]:
+    """Half-size copy (rounded up): each pixel averages its 2x2 block in premultiplied space."""
+    w2, h2 = (w + 1) // 2, (h + 1) // 2
+    out = bytearray(w2 * h2 * 4)
+    for y in range(h2):
+        for x in range(w2):
+            r = g = b = a = 0
+            for sy in (2 * y, 2 * y + 1):
+                if sy >= h:
+                    continue
+                for sx in (2 * x, 2 * x + 1):
+                    if sx >= w:
+                        continue
+                    o = (sy * w + sx) * 4
+                    pa = rgba[o + 3]
+                    r += rgba[o] * pa
+                    g += rgba[o + 1] * pa
+                    b += rgba[o + 2] * pa
+                    a += pa
+            if a:
+                o = (y * w2 + x) * 4
+                half = a // 2
+                out[o:o + 4] = bytes((min(255, (r + half) // a), min(255, (g + half) // a),
+                                      min(255, (b + half) // a), (a + 2) // 4))
+    return w2, h2, bytes(out)
